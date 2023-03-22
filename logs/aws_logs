@@ -80,7 +80,7 @@ getLogStreamName() {
     && extended+=" --starting-token $NEXTSTREAMTOKEN "
 
   # gets the streams from aws and set to variable
-  streams=$(aws logs describe-log-streams --descending --max-items 2 --log-group-name "$log_group_name" $extended)
+  streams=$(aws logs describe-log-streams --descending --max-items 20 --log-group-name "$log_group_name" $extended)
 
   # exports NEXTSTREAMTOKEN into vars file
   echo $streams |\
@@ -127,7 +127,7 @@ setLogName() {
   # use indirect variable expansion to check if value of $var_name is empty
   # if value of $var_name is empty, set it by calling the function passed in
   if [[ -z "${!var_name}" ]]; then
-    eval "$var_name"="\"$($func_name)\""
+    eval "$var_name"="\`$func_name\`"
   fi
 
   # exit script if can not set value
