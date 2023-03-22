@@ -1,0 +1,174 @@
+#!/bin/bash
+
+# Get the directory of the script
+SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
+VAR_LOCATION="$SCRIPT_DIR/vars"
+
+# source file to get all exported values if exists
+. $VAR_LOCATION 2>/dev/null
+
+# set type to export value MENUTYPE or default to fzf
+menu_type="${MENUTYPE:-fzf}"
+
+# Parse command-line options
+while getopts "m:M:t:p:nbfgs" opt; do
+  case $opt in
+    m)
+      min_time="$(date -d "$OPTARG" +%s%3N)"
+      ;;
+    M)
+      max_time="$(date -d "$OPTARG" +%s%3N)"
+      ;;
+    t)
+      menu_type="$OPTARG"
+      ;;
+    p)
+      stream_prefix="$OPTARG"
+      ;;
+    n)
+      next_stream_token="$NEXTSTREAMTOKEN"
+      log_group_name="$LOGGROUPNAME"
+      ;;
+    b)
+      next_backward_token="$NEXTBACKWARDTOKEN"
+      log_group_name="$LOGGROUPNAME"
+      log_stream_name="$LOGSTREAMNAME"
+      ;;
+    f)
+      next_forward_token="$NEXTFORWARDTOKEN"
+      log_group_name="$LOGGROUPNAME"
+      log_stream_name="$LOGSTREAMNAME"
+      ;;
+    g)
+      log_group_name="$LOGGROUPNAME"
+      ;;
+    s)
+      log_stream_name="$LOGSTREAMNAME"
+      log_group_name="$LOGGROUPNAME"
+      ;;
+    \?)
+      echo "Invalid option: -$OPTARG" >&2
+      exit 1
+      ;;
+  esac
+done
+
+create_dmenu() {
+  sort | dmenu -i -l 30
+}
+
+create_menu() {
+  [[ "$menu_type" == "fzf" ]] && fzf || create_dmenu
+}
+
+# getLogGroupByName
+getLogGroupByName() {
+  aws logs describe-log-groups |\
+    jq -r ".logGroups[].logGroupName" |\
+    create_menu
+}
+
+# getLogStreamNames
+getLogStreamName() {
+  # adds --log-stream-name-prefix if steam_prefix is not empty or --order-by LastEventTime
+  [[ -z "$stream_prefix" ]] \
+    && extended=" --order-by LastEventTime " \
+    || extended=" --log-stream-name-prefix $stream_prefix"
+
+  # adds --starting-token if has value
+  [[ -n "$next_stream_token" ]] \
+    && extended+=" --starting-token $NEXTSTREAMTOKEN "
+
+  # gets the streams from aws and set to variable
+  streams=$(aws logs describe-log-streams --descending --max-items 2 --log-group-name "$log_group_name" $extended)
+
+  # exports NEXTSTREAMTOKEN into vars file
+  echo $streams |\
+    jq "select(.NextToken != null).NextToken" |\
+    xargs -I token echo "export NEXTSTREAMTOKEN="\"token\" >> $VAR_LOCATION
+
+  # gets logStreamName and human readable lastEventTimestamp into a menu for selection
+  echo $streams |\
+    jq -r ".logStreams[] | \"\(.logStreamName) \(.lastEventTimestamp/1000 | todateiso8601)\"" |\
+    create_menu
+}
+
+# getLogEvents
+getLogEvents() {
+  # adds --start-time and --end-time to command if epoch times has value
+  [[ -n "$min_time" ]] && extended=" --start-time $min_time "
+  [[ -n "$max_time" ]] && extended+=" --end-time $max_time "
+
+  # adds --next-token to command if next_forward_token or next_backward_token has value
+  [[ -n "$next_forward_token" ]] && nextToken=" --next-token $NEXTFORWARDTOKEN "
+  [[ -n "$next_backward_token" ]] && nextToken=" --next-token $NEXTBACKWARDTOKEN "
+
+  events=$(aws logs get-log-events --log-group-name "$log_group_name" --log-stream-name "$log_stream_name" --start-from-head $extended $nextToken)
+
+  # exports NEXTFORWARDTOKEN and NEXTBACKWARDTOKEN into vars file if has not null
+  echo $events |\
+    jq "select(.nextForwardToken != null).nextForwardToken" |\
+    xargs -I token echo "export NEXTFORWARDTOKEN="\"token\" >> $VAR_LOCATION
+
+  echo $events |\
+    jq "select(.nextBackwardToken != null).nextBackwardToken" |\
+    xargs -I token echo "export NEXTBACKWARDTOKEN="\"token\" >> $VAR_LOCATION
+
+  echo $events
+}
+
+# setLogNames
+setLogName() {
+  # creates local variables for the function
+  local var_name=$1
+  local env_var_name=$2
+  local func_name=$3
+
+  # use indirect variable expansion to check if value of $var_name is empty
+  # if value of $var_name is empty, set it by calling the function passed in
+  if [[ -z "${!var_name}" ]]; then
+    eval "$var_name"="\"$($func_name)\""
+  fi
+
+  # exit script if can not set value
+  [[ -z "${!var_name}" ]] && echo "no $var_name" && exit 1
+
+  # export variable to vars file
+  exportVariable "$var_name" "$env_var_name"
+}
+
+# export variable to vars file
+exportVariable() {
+  local var_name=$1
+  local env_var_name=$2
+
+  # use indirect variable expansion to set the env_var_name to the value of the var_name
+  echo "export $env_var_name=\"${!var_name}\"" >> $VAR_LOCATION
+}
+
+# main 
+main() {
+  # create or update vars file to a new file
+  # give all privileges to owner and read and excute for group
+  touch $VAR_LOCATION; chmod 750 $VAR_LOCATION; printf "#!/bin/bash\n" > $VAR_LOCATION
+
+  # export MENUTYPE to vars file
+  exportVariable "menu_type" "MENUTYPE"
+
+  # call setLogName for both log_group_name and log_stream_name
+  setLogName "log_group_name" "LOGGROUPNAME" "getLogGroupByName"
+  setLogName "log_stream_name" "LOGSTREAMNAME" "getLogStreamName"
+
+  # reset log_stream_name to column 1 (the actual stream name) using awk
+  log_stream_name=$(awk '{print $1}' <<< $log_stream_name)
+
+  # call getLogEvents
+  events=$(getLogEvents)
+
+  # print log events with the message and a human readable timestamp into less
+  echo $events |\
+    jq '.events[] | {timestamp: (.timestamp / 1000 | todateiso8601), message}' --color-output |\
+    less -I
+}
+
+main
